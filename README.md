@@ -25,8 +25,8 @@ This userscript only works for cockpit/follow view, if any other view is selecte
 When enabled, the mouse gets hidden.
 
 Known bugs:
--Weird behaviour when looking at your seat or looking sideways0
--Smootheness setting may nt work for all devices.
+-Weird behaviour when looking at your seat or looking sideways, if you have a fix/explanation for this, please lmk.
+-Smootheness setting may not work for all devices.
 
 Default settings:
 Sensitivity:    0.10
