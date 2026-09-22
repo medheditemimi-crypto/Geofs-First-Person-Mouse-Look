@@ -1,0 +1,1175 @@
+// ==UserScript==
+// @name         GeoFS First Person Mouse Look
+// @namespace    geofs-first-person-mouselook
+// @version      2.1.1
+// @description  Smooth first-person mouse look for GeoFS with configurable settings.
+// @match        https://geo-fs.com/geofs.php*
+// @match        https://www.geo-fs.com/geofs.php*
+// @match        https://*.geo-fs.com/geofs.php*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+(() => {
+    'use strict';
+
+    // =========================================================
+    // DEFAULT SETTINGS
+    // =========================================================
+
+    const DEFAULTS = {
+        sensitivity: 0.10,
+        smoothing: 14,
+        minPitch: -80,
+        maxPitch: 80,
+        invertX: false,
+        invertY: false,
+        toggleKey: 'KeyI'
+    };
+
+    const SETTINGS = {
+        ...DEFAULTS
+    };
+
+    const STORAGE_KEY =
+        'geofs_first_person_mouse_look_settings';
+
+    // =========================================================
+    // LOAD / SAVE SETTINGS
+    // =========================================================
+
+    function loadSettings() {
+        try {
+            const saved =
+                JSON.parse(
+                    localStorage.getItem(STORAGE_KEY)
+                );
+
+            if (
+                saved &&
+                typeof saved === 'object'
+            ) {
+                Object.assign(
+                    SETTINGS,
+                    DEFAULTS,
+                    saved
+                );
+            }
+        } catch (error) {
+            console.warn(
+                '[GeoFS Mouse Look] Could not load settings.',
+                error
+            );
+        }
+    }
+
+    function saveSettings() {
+        try {
+            localStorage.setItem(
+                STORAGE_KEY,
+                JSON.stringify(SETTINGS)
+            );
+        } catch (_) {}
+    }
+
+    loadSettings();
+
+    // =========================================================
+    // GEOFS API ADAPTER
+    // =========================================================
+
+    const GEOFS = {
+
+        ready(g) {
+            return !!(
+                g &&
+                g.camera &&
+                typeof g.camera.set === 'function' &&
+                typeof g.camera.setRotation === 'function' &&
+                g.api?.viewer?.scene?.canvas &&
+                g.aircraft?.instance?.definition?.cameras?.cockpit
+            );
+        },
+
+        canvas(g) {
+            return g.api.viewer.scene.canvas;
+        },
+
+        cockpitMode(g) {
+
+            if (
+                g.camera.currentModeName ===
+                'cockpit'
+            ) {
+                return Number.isInteger(
+                    g.camera.currentMode
+                )
+                    ? g.camera.currentMode
+                    : 0;
+            }
+
+            return 0;
+        },
+
+        orientation(g) {
+
+            const o =
+                g.aircraft
+                    .instance
+                    .definition
+                    .cameras
+                    .cockpit
+                    .orientation;
+
+            if (
+                Array.isArray(o) &&
+                o.length >= 3
+            ) {
+                return [
+                    Number(o[0]) || 0,
+                    Number(o[1]) || 0,
+                    Number(o[2]) || 0
+                ];
+            }
+
+            return [0, 0, 0];
+        },
+
+        setMode(g, mode) {
+            g.camera.set(mode);
+        },
+
+        rotation(g, yaw, pitch, roll) {
+            g.camera.setRotation(
+                yaw,
+                pitch,
+                roll
+            );
+        }
+    };
+
+    // =========================================================
+    // STATE
+    // =========================================================
+
+    let geofs = null;
+    let canvas = null;
+
+    let active = false;
+    let waitingForPointerLock = false;
+
+    let mouseAttached = false;
+
+    let frame = 0;
+    let lastTime = 0;
+
+    let previousMode = null;
+    let previousOrientation = [0, 0, 0];
+    let previousCursor = '';
+
+    let cockpitMode = 0;
+
+    let targetYaw = 0;
+    let currentYaw = 0;
+
+    let targetPitch = 0;
+    let currentPitch = 0;
+
+    let roll = 0;
+
+    // =========================================================
+    // CAMERA MATH
+    // =========================================================
+
+    function shortestDifference(a, b) {
+
+        let d = b - a;
+
+        while (d > 180) {
+            d -= 360;
+        }
+
+        while (d < -180) {
+            d += 360;
+        }
+
+        return d;
+    }
+
+    function normalizeYaw(yaw) {
+
+        let value =
+            yaw % 360;
+
+        if (value > 180) {
+            value -= 360;
+        }
+
+        if (value < -180) {
+            value += 360;
+        }
+
+        return value;
+    }
+
+    // =========================================================
+    // CAMERA UPDATE
+    // =========================================================
+
+    function updateCamera(dt) {
+
+        if (
+            !active ||
+            !GEOFS.ready(geofs)
+        ) {
+            return;
+        }
+
+        try {
+
+            if (
+                geofs.camera.currentModeName !==
+                'cockpit'
+            ) {
+                GEOFS.setMode(
+                    geofs,
+                    cockpitMode
+                );
+            }
+
+            const smoothing =
+                Math.max(
+                    1,
+                    Number(
+                        SETTINGS.smoothing
+                    ) || 14
+                );
+
+            const alpha =
+                1 -
+                Math.exp(
+                    -smoothing * dt
+                );
+
+            currentYaw +=
+                shortestDifference(
+                    currentYaw,
+                    targetYaw
+                ) * alpha;
+
+            currentPitch +=
+                (
+                    targetPitch -
+                    currentPitch
+                ) * alpha;
+
+            currentPitch =
+                Math.max(
+                    SETTINGS.minPitch,
+                    Math.min(
+                        SETTINGS.maxPitch,
+                        currentPitch
+                    )
+                );
+
+            GEOFS.rotation(
+                geofs,
+                normalizeYaw(currentYaw),
+                currentPitch,
+                roll
+            );
+
+        } catch (error) {
+
+            console.warn(
+                '[GeoFS Mouse Look] Camera error:',
+                error
+            );
+        }
+    }
+
+    function loop(time) {
+
+        if (!active) {
+            return;
+        }
+
+        if (!lastTime) {
+            lastTime = time;
+        }
+
+        let dt =
+            (time - lastTime) / 1000;
+
+        lastTime = time;
+
+        dt =
+            Math.min(
+                dt,
+                0.1
+            );
+
+        updateCamera(dt);
+
+        frame =
+            requestAnimationFrame(
+                loop
+            );
+    }
+
+    // =========================================================
+    // MOUSE
+    // =========================================================
+
+    function mouseMove(event) {
+
+        if (
+            !active ||
+            document.pointerLockElement !== canvas
+        ) {
+            return;
+        }
+
+        const dx =
+            Number.isFinite(event.movementX)
+                ? event.movementX
+                : 0;
+
+        const dy =
+            Number.isFinite(event.movementY)
+                ? event.movementY
+                : 0;
+
+        targetYaw +=
+            dx *
+            SETTINGS.sensitivity *
+            (
+                SETTINGS.invertX
+                    ? -1
+                    : 1
+            );
+
+        targetPitch +=
+            dy *
+            SETTINGS.sensitivity *
+            (
+                SETTINGS.invertY
+                    ? 1
+                    : -1
+            );
+
+        targetPitch =
+            Math.max(
+                SETTINGS.minPitch,
+                Math.min(
+                    SETTINGS.maxPitch,
+                    targetPitch
+                )
+            );
+
+        event.preventDefault();
+        event.stopImmediatePropagation();
+    }
+
+    function attachMouse() {
+
+        if (mouseAttached) {
+            return;
+        }
+
+        document.addEventListener(
+            'mousemove',
+            mouseMove,
+            true
+        );
+
+        mouseAttached = true;
+    }
+
+    function detachMouse() {
+
+        if (!mouseAttached) {
+            return;
+        }
+
+        document.removeEventListener(
+            'mousemove',
+            mouseMove,
+            true
+        );
+
+        mouseAttached = false;
+    }
+
+    // =========================================================
+    // ENABLE
+    // =========================================================
+
+    function enable() {
+
+        if (active) {
+            return;
+        }
+
+        if (!GEOFS.ready(geofs)) {
+            console.warn(
+                '[GeoFS Mouse Look] GeoFS is not ready yet.'
+            );
+            return;
+        }
+
+        canvas =
+            GEOFS.canvas(geofs);
+
+        if (
+            !(canvas instanceof HTMLCanvasElement)
+        ) {
+            return;
+        }
+
+        previousMode =
+            Number.isInteger(
+                geofs.camera.currentMode
+            )
+                ? geofs.camera.currentMode
+                : 0;
+
+        previousOrientation =
+            GEOFS.orientation(geofs);
+
+        previousCursor =
+            canvas.style.cursor;
+
+        cockpitMode =
+            GEOFS.cockpitMode(geofs);
+
+        GEOFS.setMode(
+            geofs,
+            cockpitMode
+        );
+
+        const orientation =
+            GEOFS.orientation(geofs);
+
+        targetYaw =
+            orientation[0];
+
+        currentYaw =
+            targetYaw;
+
+        targetPitch =
+            Math.max(
+                SETTINGS.minPitch,
+                Math.min(
+                    SETTINGS.maxPitch,
+                    orientation[1]
+                )
+            );
+
+        currentPitch =
+            targetPitch;
+
+        roll =
+            orientation[2];
+
+        active = true;
+        waitingForPointerLock = true;
+
+        lastTime = 0;
+
+        canvas.style.cursor =
+            'none';
+
+        frame =
+            requestAnimationFrame(
+                loop
+            );
+
+        try {
+
+            const result =
+                canvas.requestPointerLock();
+
+            if (
+                result &&
+                typeof result.catch ===
+                'function'
+            ) {
+                result.catch(() => {
+                    disable();
+                });
+            }
+
+        } catch (error) {
+
+            console.warn(
+                '[GeoFS Mouse Look] Pointer lock failed.',
+                error
+            );
+
+            disable();
+        }
+    }
+
+    // =========================================================
+    // DISABLE
+    // =========================================================
+
+    function disable() {
+
+        active = false;
+        waitingForPointerLock = false;
+
+        detachMouse();
+
+        if (frame) {
+            cancelAnimationFrame(frame);
+            frame = 0;
+        }
+
+        lastTime = 0;
+
+        if (canvas) {
+            canvas.style.cursor =
+                previousCursor;
+        }
+
+        if (
+            document.pointerLockElement ===
+            canvas
+        ) {
+            try {
+                document.exitPointerLock();
+            } catch (_) {}
+        }
+
+        if (
+            GEOFS.ready(geofs)
+        ) {
+            try {
+
+                GEOFS.setMode(
+                    geofs,
+                    previousMode
+                );
+
+                GEOFS.rotation(
+                    geofs,
+                    previousOrientation[0],
+                    previousOrientation[1],
+                    previousOrientation[2]
+                );
+
+            } catch (_) {}
+        }
+    }
+
+    // =========================================================
+    // POINTER LOCK
+    // =========================================================
+
+    function pointerLockChange() {
+
+        const locked =
+            document.pointerLockElement ===
+            canvas;
+
+        if (locked) {
+
+            waitingForPointerLock =
+                false;
+
+            if (active) {
+                attachMouse();
+            }
+
+            return;
+        }
+
+        detachMouse();
+
+        if (
+            active &&
+            !waitingForPointerLock
+        ) {
+            disable();
+        }
+    }
+
+    function pointerLockError() {
+        disable();
+    }
+
+    // =========================================================
+    // KEYBOARD
+    // =========================================================
+
+    function isTyping(target) {
+
+        const el =
+            target instanceof Element
+                ? target
+                : document.activeElement;
+
+        if (!el) {
+            return false;
+        }
+
+        return (
+            el.isContentEditable ||
+            el.tagName === 'INPUT' ||
+            el.tagName === 'TEXTAREA' ||
+            el.tagName === 'SELECT' ||
+            !!el.closest?.(
+                '[contenteditable="true"]'
+            )
+        );
+    }
+
+    function isGameArea(target) {
+
+        if (
+            target === window ||
+            target === document ||
+            target === document.body ||
+            target === document.documentElement
+        ) {
+            return true;
+        }
+
+        if (!(target instanceof Element)) {
+            return false;
+        }
+
+        return (
+            target === canvas ||
+            target.closest?.('canvas') === canvas
+        );
+    }
+
+    function keyDown(event) {
+
+        if (event.repeat) {
+            return;
+        }
+
+        if (
+            event.code !==
+            SETTINGS.toggleKey
+        ) {
+            return;
+        }
+
+        if (
+            isTyping(
+                event.target
+            )
+        ) {
+            return;
+        }
+
+        if (
+            !isGameArea(
+                event.target
+            )
+        ) {
+            return;
+        }
+
+        event.preventDefault();
+        event.stopImmediatePropagation();
+
+        if (active) {
+            disable();
+        } else {
+            enable();
+        }
+    }
+
+    // =========================================================
+    // SIMPLE SETTINGS WINDOW
+    // =========================================================
+    //
+    // This is deliberately built into the script rather than
+    // depending on another userscript/library.
+    //
+    // Press F8 to open it.
+    // =========================================================
+
+    function createSettingsUI() {
+
+        if (
+            document.getElementById(
+                'geofs-fpml-settings'
+            )
+        ) {
+            return;
+        }
+
+        const panel =
+            document.createElement('div');
+
+        panel.id =
+            'geofs-fpml-settings';
+
+        panel.style.cssText = `
+            position: fixed !important;
+            top: 50% !important;
+            left: 50% !important;
+            transform: translate(-50%, -50%) !important;
+            width: 330px !important;
+            padding: 18px !important;
+
+            background: #1e1e1e !important;
+            color: #ffffff !important;
+
+            font-family: Arial, sans-serif !important;
+            font-size: 14px !important;
+
+            border: 1px solid #555 !important;
+            border-radius: 8px !important;
+
+            box-shadow: 0 10px 40px rgba(0,0,0,.6) !important;
+            z-index: 2147483647 !important;
+            display: none !important;
+        `;
+
+        panel.innerHTML = `
+            <div style="
+                font-size:18px !important;
+                font-weight:bold !important;
+                margin-bottom:15px !important;
+                color:#ffffff !important;
+            ">
+                First Person Mouse Look
+            </div>
+
+            <label style="color:#ffffff !important;">
+                Sensitivity
+                <input
+                    id="fpml-sensitivity"
+                    type="number"
+                    step="0.01"
+                    min="0.001"
+                    max="2"
+                    style="
+                        width:100% !important;
+                        margin:6px 0 12px !important;
+                        padding:6px !important;
+                        background:#ffffff !important;
+                        color:#111111 !important;
+                        border:1px solid #999 !important;
+                        border-radius:4px !important;
+                    "
+                >
+            </label>
+
+            <label style="color:#ffffff !important;">
+                Smoothing
+                <input
+                    id="fpml-smoothing"
+                    type="number"
+                    step="1"
+                    min="1"
+                    max="60"
+                    style="
+                        width:100% !important;
+                        margin:6px 0 12px !important;
+                        padding:6px !important;
+                        background:#ffffff !important;
+                        color:#111111 !important;
+                        border:1px solid #999 !important;
+                        border-radius:4px !important;
+                    "
+                >
+            </label>
+
+            <label style="color:#ffffff !important;">
+                Minimum Pitch
+                <input
+                    id="fpml-minpitch"
+                    type="number"
+                    min="-89"
+                    max="0"
+                    style="
+                        width:100% !important;
+                        margin:6px 0 12px !important;
+                        padding:6px !important;
+                        background:#ffffff !important;
+                        color:#111111 !important;
+                        border:1px solid #999 !important;
+                        border-radius:4px !important;
+                    "
+                >
+            </label>
+
+            <label style="color:#ffffff !important;">
+                Maximum Pitch
+                <input
+                    id="fpml-maxpitch"
+                    type="number"
+                    min="0"
+                    max="89"
+                    style="
+                        width:100% !important;
+                        margin:6px 0 12px !important;
+                        padding:6px !important;
+                        background:#ffffff !important;
+                        color:#111111 !important;
+                        border:1px solid #999 !important;
+                        border-radius:4px !important;
+                    "
+                >
+            </label>
+
+            <label style="
+                display:block !important;
+                margin:8px 0 !important;
+                color:#ffffff !important;
+            ">
+                <input
+                    id="fpml-invertx"
+                    type="checkbox"
+                >
+                Invert horizontal
+            </label>
+
+            <label style="
+                display:block !important;
+                margin:8px 0 14px !important;
+                color:#ffffff !important;
+            ">
+                <input
+                    id="fpml-inverty"
+                    type="checkbox"
+                >
+                Invert vertical
+            </label>
+
+            <label style="color:#ffffff !important;">
+                Toggle key
+                <select
+                    id="fpml-key"
+                    style="
+                        width:100% !important;
+                        margin:6px 0 15px !important;
+                        padding:6px !important;
+                        background:#ffffff !important;
+                        color:#111111 !important;
+                        border:1px solid #999 !important;
+                        border-radius:4px !important;
+                    "
+                >
+                    ${[
+                        'KeyI',
+                        'KeyM',
+                        'KeyN',
+                        'KeyF',
+                        'KeyV',
+                        'KeyC',
+                        'KeyX',
+                        'KeyZ',
+                        'F6',
+                        'F7',
+                        'F8',
+                        'F9',
+                        'F10',
+                        'F11',
+                        'F12'
+                    ].map(
+                        key =>
+                            `<option value="${key}">
+                                ${key.replace('Key','')}
+                            </option>`
+                    ).join('')}
+                </select>
+            </label>
+
+            <button
+                id="fpml-save"
+                style="
+                    width:100% !important;
+                    padding:9px !important;
+                    cursor:pointer !important;
+                    background:#ffffff !important;
+                    color:#111111 !important;
+                    border:1px solid #999 !important;
+                    border-radius:4px !important;
+                "
+            >
+                Save
+            </button>
+
+            <button
+                id="fpml-close"
+                style="
+                    width:100% !important;
+                    padding:9px !important;
+                    margin-top:7px !important;
+                    cursor:pointer !important;
+                    background:#dddddd !important;
+                    color:#111111 !important;
+                    border:1px solid #999 !important;
+                    border-radius:4px !important;
+                "
+            >
+                Close
+            </button>
+
+            <div style="
+                margin-top:12px !important;
+                opacity:.75 !important;
+                font-size:12px !important;
+                color:#ffffff !important;
+            ">
+                Press F8 to open these settings.
+            </div>
+        `;
+
+        document.body.appendChild(panel);
+
+        function refresh() {
+
+            panel.querySelector(
+                '#fpml-sensitivity'
+            ).value =
+                SETTINGS.sensitivity;
+
+            panel.querySelector(
+                '#fpml-smoothing'
+            ).value =
+                SETTINGS.smoothing;
+
+            panel.querySelector(
+                '#fpml-minpitch'
+            ).value =
+                SETTINGS.minPitch;
+
+            panel.querySelector(
+                '#fpml-maxpitch'
+            ).value =
+                SETTINGS.maxPitch;
+
+            panel.querySelector(
+                '#fpml-invertx'
+            ).checked =
+                SETTINGS.invertX;
+
+            panel.querySelector(
+                '#fpml-inverty'
+            ).checked =
+                SETTINGS.invertY;
+
+            panel.querySelector(
+                '#fpml-key'
+            ).value =
+                SETTINGS.toggleKey;
+        }
+
+        panel.querySelector(
+            '#fpml-save'
+        ).addEventListener(
+            'click',
+            () => {
+
+                SETTINGS.sensitivity =
+                    Math.max(
+                        0.001,
+                        Math.min(
+                            2,
+                            parseFloat(
+                                panel.querySelector(
+                                    '#fpml-sensitivity'
+                                ).value
+                            ) || DEFAULTS.sensitivity
+                        )
+                    );
+
+                SETTINGS.smoothing =
+                    Math.max(
+                        1,
+                        Math.min(
+                            60,
+                            parseFloat(
+                                panel.querySelector(
+                                    '#fpml-smoothing'
+                                ).value
+                            ) || DEFAULTS.smoothing
+                        )
+                    );
+
+                SETTINGS.minPitch =
+                    Math.max(
+                        -89,
+                        Math.min(
+                            0,
+                            parseFloat(
+                                panel.querySelector(
+                                    '#fpml-minpitch'
+                                ).value
+                            )
+                        )
+                    );
+
+                SETTINGS.maxPitch =
+                    Math.max(
+                        0,
+                        Math.min(
+                            89,
+                            parseFloat(
+                                panel.querySelector(
+                                    '#fpml-maxpitch'
+                                ).value
+                            )
+                        )
+                    );
+
+                SETTINGS.invertX =
+                    panel.querySelector(
+                        '#fpml-invertx'
+                    ).checked;
+
+                SETTINGS.invertY =
+                    panel.querySelector(
+                        '#fpml-inverty'
+                    ).checked;
+
+                SETTINGS.toggleKey =
+                    panel.querySelector(
+                        '#fpml-key'
+                    ).value;
+
+                saveSettings();
+
+                panel.style.display =
+                    'none';
+            }
+        );
+
+        panel.querySelector(
+            '#fpml-close'
+        ).addEventListener(
+            'click',
+            () => {
+                panel.style.display =
+                    'none';
+            }
+        );
+
+        panel.addEventListener(
+            'keydown',
+            event => {
+                event.stopPropagation();
+            }
+        );
+
+        refresh();
+
+        return panel;
+    }
+
+    function toggleSettings() {
+
+        const panel =
+            document.getElementById(
+                'geofs-fpml-settings'
+            );
+
+        if (!panel) {
+            return;
+        }
+
+        if (
+            panel.style.display ===
+            'none'
+        ) {
+            panel.style.display =
+                'block';
+        } else {
+            panel.style.display =
+                'none';
+        }
+    }
+
+    function settingsKey(event) {
+
+        if (
+            event.code === 'F8' &&
+            !isTyping(event.target)
+        ) {
+            event.preventDefault();
+            event.stopPropagation();
+
+            toggleSettings();
+        }
+    }
+
+    // =========================================================
+    // INITIALIZATION
+    // =========================================================
+
+    function waitForGeoFS() {
+
+        const timer =
+            setInterval(() => {
+
+                if (
+                    !GEOFS.ready(
+                        window.geofs
+                    )
+                ) {
+                    return;
+                }
+
+                clearInterval(timer);
+
+                geofs =
+                    window.geofs;
+
+                canvas =
+                    GEOFS.canvas(
+                        geofs
+                    );
+
+                window.addEventListener(
+                    'keydown',
+                    settingsKey,
+                    true
+                );
+
+                window.addEventListener(
+                    'keydown',
+                    keyDown,
+                    true
+                );
+
+                document.addEventListener(
+                    'pointerlockchange',
+                    pointerLockChange
+                );
+
+                document.addEventListener(
+                    'pointerlockerror',
+                    pointerLockError
+                );
+
+                createSettingsUI();
+
+                console.info(
+                    '[GeoFS Mouse Look] Loaded.'
+                );
+
+                console.info(
+                    '[GeoFS Mouse Look] Press I to toggle mouse look.'
+                );
+
+                console.info(
+                    '[GeoFS Mouse Look] Press F8 for settings.'
+                );
+
+            }, 250);
+    }
+
+    waitForGeoFS();
+
+})();
